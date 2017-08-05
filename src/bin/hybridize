@@ -1,0 +1,665 @@
+#!/usr/bin/perl
+
+use warnings;
+use strict;
+
+use File::Copy;
+use File::Basename;
+use Getopt::Long qw(:config no_ignore_case require_order);
+use File::Path;
+use Cwd;
+
+my $prog = 'hybridize';
+my $version = "3.0.0";
+
+my $opt_version;
+my $opt_help;
+my $opt_noModifyList;
+my $opt_copyList;
+my $opt_ownership;
+my $opt_linkRoot;
+my $opt_excludeList;
+my $opt_purge;
+my $opt_verbose;
+my $opt_changes;
+my $changed = 0;
+
+GetOptions(
+        'changed'		=> \$opt_changes,
+        'greylist|g=s'		=> \$opt_noModifyList,
+        'noModifyList|g=s'	=> \$opt_noModifyList,
+        'copylist|c=s'		=> \$opt_copyList,
+        'whitelist|c=s'		=> \$opt_copyList,
+        'excludelist|x=s'	=> \$opt_excludeList,
+        'linkRoot|r=s'		=> \$opt_linkRoot,
+        'help|h'		=> \$opt_help,
+        'o|owner'		=> \$opt_ownership,
+        'purge'			=> \$opt_purge,
+        'version'		=> \$opt_version,
+        'v|verbose'		=> \$opt_verbose,
+);
+
+main(@ARGV);
+sub main {
+	if ($opt_version) {
+		print "prog v$version\n";
+		exit 0;
+	};
+
+	if ($opt_help) {
+		&help;
+	};
+
+	if (@_ < 2) {
+		print "Error: This program requires two arguments!\n";
+		&help;
+	};
+
+	my $source = shift(@_);
+	my $dest = shift(@_);
+
+	if (@_) {
+		$opt_copyList = shift(@_);
+	}
+	if (@_) {
+		$opt_linkRoot = shift(@_);
+	}
+
+	my $linkRoot;
+	if ($opt_linkRoot) {
+		$linkRoot = $opt_linkRoot;
+	}
+	else {
+		$linkRoot = $source;
+	}
+	
+
+	my @destList = ();
+	my %fileList = ();
+	my @noModifyList = ();
+	my @copyList_reg = ();
+	my @excludeList_reg = ();
+	if (! -d $dest) {
+		mkdir $dest;
+		chmod(oct("0755"), $dest);
+	}
+	if ($opt_purge) {
+		@destList = sort(get_filetree($dest));
+	}
+
+	if ($opt_noModifyList) {
+		verbose("Reading noModifyList...");
+		@noModifyList = read_regex_file($opt_noModifyList);
+	}
+	if ($opt_copyList) {
+		verbose("Reading copyList...");
+		@copyList_reg = read_regex_file($opt_copyList);
+	}
+	if ($opt_excludeList) {
+		verbose("Reading excludeList...");
+		@excludeList_reg = read_regex_file($opt_excludeList);
+	}
+
+
+	verbose("Getting Files Lists...");
+	my @files = sort(get_filetree($source));
+
+	my @linkList;
+	my @copyList = ();
+	my $lastLink;
+	verbose("Categorizing Files...");
+	File: foreach my $file (@files) {
+		if ($opt_purge) {
+			$fileList{$file} = 1;
+		};
+	
+		if (! $file=~/\S/) {
+			next File;
+		}
+	
+		if ($lastLink && $file=~/\Q$lastLink\E\/.*/) {
+			next File;
+		};
+	
+		if (item_in_array($file, \@excludeList_reg)) {
+			next File
+		}
+
+		if (item_in_array($file, \@copyList_reg)) {
+			push(@copyList, $file);
+		}
+		else {
+			push(@linkList, $file);
+			$lastLink = $file;
+		};
+	};
+	
+	
+	verbose("Copying Whitelist Files...");
+	File: foreach my $file (@copyList) {
+		if (! $file=~/\S/) {
+			next File;
+		}
+	
+		my $baseDir = basedir($file);
+		if ( ! -d "$dest/$baseDir") {
+			print "Error directory '$dest/$baseDir' does not exist for '$file' \n";
+			exit 100;
+		}
+		if (!(-e "$dest/$file" && item_in_array($file, \@noModifyList))) {
+			sync("$source/$file", "$dest/$file");
+		};
+	};
+	
+	verbose("Creating Links...");
+	File: foreach my $file (@linkList) {
+		if (! $file=~/\S/) {
+			next File;
+		}
+		my $baseDir = basedir($file);
+		if ( ! -d "$dest/$baseDir") {
+			print "Error directory '$dest/$baseDir' does not exist for '$file'\n";
+			exit 100;
+		}
+			
+		if (linked_path($dest, $file)) {
+			next File;
+		}
+		if (! -l "$dest/$file") {
+			remove("$dest/$file");
+		}
+		if (-l "$dest/$file" && (readlink("$dest/$file") ne "$linkRoot/$file")) {
+			remove("$dest/$file");
+		}
+	
+
+		if (!(-l "$dest/$file")) {
+			symlink("$linkRoot/$file", "$dest/$file") or die "Failed to create symlink '$dest/$file' -> '$linkRoot/$file': $!\n";
+			$changed++;
+		}
+	}
+	
+
+	if ($opt_purge) {
+		verbose("Cleaning up (purging other files)...");
+		File: foreach my $file (@destList) {
+			if ($file eq '.' || $file eq '..') {
+				next File;
+			}
+			if (item_in_array($file, \@excludeList_reg)) {
+				next File
+			}
+			if (item_in_array($file, \@copyList_reg)) {
+				next File
+			}
+			if (item_in_array($file, \@noModifyList)) {
+				next File
+			}
+			if (!($fileList{$file})) {
+				remove("$dest/$file");
+			}
+		}
+	}
+	if ($changed || !$opt_changes) {
+		exit 0;
+	}
+	exit 1;
+}
+
+sub read_regex_file {
+	my $file = shift(@_);
+
+	my @return = ();
+	open(my $fh, "<", $file) or die "Could not open file '$file': $!";
+	my @items = <$fh>;
+	close($fh);
+	foreach my $item (@items) {
+	        $item =~s/\s$//;
+		$item =~s/\*/.*/g;
+	        $item =~s/^\.\//\//;
+		push(@return, $item);
+	}
+	return @return;
+}
+
+sub item_in_array {
+	my $item = $_[0];
+
+	my @item_path=split('/', $item);
+	my @array = @{$_[1]};
+
+	Element: foreach my $element (@array) {
+		my @element_path = split("\/", $element);
+		for (my $i = 0; $i <= $#element_path && $i <= $#item_path; $i++) {
+			if ($item_path[$i]=~/^$element_path[$i]$/) {
+				if ($i == $#element_path || $i == $#item_path) {
+					return 1;
+				}
+			}
+			else {
+				next Element;
+			}
+		}
+	}
+
+	return 0;
+}
+
+## basedir
+# Get the directory containing the given file.
+# INPUT1: path to file
+# OUTPUT: path to it's containing directory
+sub basedir {
+	my $path = $_[0];
+	$path=~s/\/$//g;
+	my @dirs = split("/", $path);
+	my $return = '';
+	for (my $i = 0; $i < @dirs -1; $i++) {
+		my $dir = $dirs[$i];
+		$return .= "$dir/";
+	};
+	return $return;
+};
+
+sub help {
+	print "hyridize [options] [source] [dest]";
+	print "\n";
+	print "source: Path to the directory containing files that should be hybridize\n";
+	print "dest: Path to directory to create hybridized directory structure\n";
+	print "[options]\n";
+	print "--copylist: file containing list of files that need to be in the destination instead of placed as links\n";
+	print "--excludelist: files to ignore\n";
+	print "--noModifyList: file containing list of files that need to be in place, but not modified\n";
+	print "linkRoot: for all links created, this shall be their root (in fron of the dir tree from dest\n";
+	exit 0;
+};
+
+
+## sync
+# Similar to rsync without recursion. Will check to see if a given file is the same as the source, and if not, copy it over.
+# INPUT1: path to file to copy from
+# INPUT2: path to copy the file to
+sub sync {
+	my $source = $_[0];
+	my $dest = $_[1];
+	my $return = 0;
+
+	if (files_differ($source, $dest)) {
+		$changed++;
+
+		if ( -l $source) {
+			remove($dest);
+			my $newLink = readlink($source);
+			symlink($newLink, $dest) or die "1Failed to create symlink '$dest' -> '$newLink': $!\n";
+		}
+		elsif ( -f $source) {
+			if ( ! -f $dest || -l $dest) {
+				remove($dest);
+			}
+			verbose("Copying '$source' to '$dest'");
+			copy($source, $dest) or die "Failed to copy file $source to $dest: $!\n";
+
+
+			# If specified try to preserve ownership
+			if ($opt_ownership) {
+				my ($uid,$gid) = get_ownership($source);
+				chown($uid,$gid,$dest);
+			};
+
+			my $mode = get_mode($source);
+			chmod($mode, $dest) or die "Failed to set perms on $dest: $!\n";
+			
+			my $mtime = get_mtime($source);
+			utime($mtime, $mtime, $dest);
+		
+	
+		}
+		elsif ( -d $source ) {
+			if ( ! -d $dest || -l $dest ) {
+				remove($dest);
+			}
+			if (! -e $dest) {
+				mkdir $dest;
+			}
+			if ($opt_ownership) {
+				my ($uid,$gid) = get_ownership($source);
+				chown($uid,$gid,$dest);
+			};
+			my $mode = get_mode($source);
+			chmod($mode, $dest);
+			
+			 
+		}
+		else {
+			my @stat1 = stat($source);
+			my @stat2 = stat($dest);
+			if ($stat1[6]) {
+				remove($dest);
+				my $rdev = sprintf("%x", $stat1[6]);
+				my $major = 0;
+				my $minor = 0;
+				if ($rdev=~/(\d)(\d)(\d)/) {
+					$major = $1;
+					$minor = $3;
+				}
+				system("mknod '$dest' c $major $minor >/dev/null 2>&1");
+				if ($opt_ownership) {
+					my ($uid,$gid) = get_ownership($source);
+					chown($uid,$gid,$dest);
+				};
+				my $mode = get_mode($source);
+				chmod($mode, $dest);
+				my $mtime = get_mtime($source);
+				utime($mtime, $mtime, $dest);
+				return 1;
+			}
+			print "Cannot Identify file '$source'. Attempting to copy...\n";
+			remove($dest);
+			
+			copy($source, $dest) or die "Failed to copy unknown from '$source' to '$dest': $!\n";
+
+			# If specified try to preserve ownership
+			if ($opt_ownership) {
+				my ($uid,$gid) = get_ownership($source);
+				chown($uid,$gid,$dest);
+			};
+			my $mode = get_mode($source);
+			chmod($mode, $dest);
+			my $mtime = get_mtime($source);
+			utime($mtime, $mtime, $dest);
+		
+	
+		};
+	};
+	return 1;
+};
+
+
+## remove
+# Delete a given file or directory structure. VERY DANGERIOUS!
+# INPUT1: path to file/directory to delete
+sub remove {
+	my $file = $_[0];
+	if (! -e $file && ! -l $file) {
+		return;
+	}
+
+	verbose("Deleting '$file'");
+	if (-d $file && ! -l $file) {
+		rmtree($file) or die "Failed to remove directory '$file': $!\n";
+	}
+	else {
+		unlink($file) or die "Failed to unlink (delete) '$file'";
+	}
+	if (-e $file) {
+		die "Failed to remove '$file'!\n";
+	}
+	$changed++;	
+}
+
+## files_differ
+# INPUT1: compare two files to see if they are the same.
+# OUTPUT: return true (1) if files are in fact different, otherwise 0.
+sub files_differ {
+	my $file1 = $_[0];
+	my $file2 = $_[1];
+
+	if ( -l $file1 ) {
+		## Dealing with symlinks
+		# WARNING! This check must go before any other, as the -f and -d operators will return true if the link points to a file or directory.
+		if (! -l $file2 ) {
+			return 1;
+		}
+		my $link1=readlink($file1);
+		my $link2=readlink($file2);
+		if ($link1 ne $link2) {
+			return 1;
+		}
+	}
+	elsif ( -f $file1 ) {
+		## Dealing with normal files
+		if (! -f $file2 || -l $file2) {
+			return 1;
+		}
+		my @stat1 = stat($file1);
+		my @stat2 = stat($file2);
+		
+		#compare mtime
+		if ( $stat1[9] != $stat2[9] ) {
+			return 1;
+		}
+
+		if ($opt_ownership) {
+			# compare owners
+			if ($stat1[4] != $stat2[4]) {
+				return 1;
+			}
+
+			# compare groups
+			if ($stat1[5] != $stat2[5]) {
+				return 1;
+			}
+		}
+
+		# compare perms
+		if ($stat1[2] != $stat2[2]) {
+			return 1;
+		}
+		
+	
+		#compare size
+		if ($stat1[7] != $stat2[7]) {
+			return 1;
+		}
+		
+	}
+	elsif ( -d $file1 ) {
+		## dealing with directories
+		if (! -d $file2 || -l $file2) {
+			return 1;
+		}
+		my @stat1 = stat($file1);
+		my @stat2 = stat($file2);
+		#compare mtime
+		if ( $stat1[2] != $stat2[2] ) {
+			return 1;
+		}
+		if ($opt_ownership) {
+			# compare owners
+			if ($stat1[4] != $stat2[4]) {
+				return 1;
+			}
+
+			# compare groups
+			if ($stat1[5] != $stat2[5]) {
+				return 1;
+			}
+		}
+
+		# compare perms
+		if ($stat1[2] != $stat2[2]) {
+			return 1;
+		}
+	}
+	else {
+		my @stat1 = stat($file1);
+		my @stat2 = stat($file2);
+		# deal with special files (see man mknod if you don't know what these are)
+		# ie /dev/null
+		if ($stat1[6]) {
+			if ($stat2[6] && $stat1[6] != $stat2[6]) {
+				return 1;
+			};
+			if ($opt_ownership) {
+				# compare owners
+				if ($stat1[4] != $stat2[4]) {
+					return 1;
+				}
+
+				# compare groups
+				if ($stat1[5] != $stat2[5]) {
+					return 1;
+				}
+			}
+
+			# compare perms
+			if ($stat1[2] != $stat2[2]) {
+				return 1;
+			};
+			return 0;
+		};
+
+		# If we cannot determine what the file is, we return 1 as we cannot be sure it differs. So we assume it does.
+		return 1;
+	};
+
+	return 0;
+		
+}
+
+
+## get_mtime
+# Get the last time a given file was modified.
+# INPUT1: path to file
+# OUTPUT:time file was last modified in seconds since epoch.
+sub get_mtime {
+	my $file = $_[0];
+
+	my @stat = stat($file);
+	return $stat[9];
+}
+
+
+## get_ownership
+# Get the owner and group of a file
+# INPUT1: path to file
+# OUTPUT: (array) index 0 is uid and index 1 is gid.
+sub get_ownership {
+	my $file = $_[0];
+	
+	my @stat = stat($file);
+	my $user = $stat[4];
+	my $group = $stat[5];
+	return ($user, $group);
+};
+
+## get_mode
+# get the permissions for a given file
+# INPUT: path to file
+# OUTPUT: permissions of file in decimal (convert to octal to see the normal format (ie 0755)
+sub get_mode {
+	my $file = $_[0];
+	
+	my @stat = stat($file);
+	my $mode = $stat[2] & 07777;
+	#my $mode = $stat[2];
+	return $mode;
+};
+
+
+## linked_path
+# Check to see if the path to a file is symlinked (check to ensure we don't mes with spaces that are outside of our working area)
+# INPUT: path to file
+# OUTPUT: true (1) if file location is redirected by a symlink. Otherwise false (0)
+sub linked_path {
+	my $base_path=$_[0];
+	my $file = $_[1];
+	my @path = split('/', $file);
+	pop(@path);
+
+	foreach my $dir (@path) {
+		$base_path.= "/$dir";
+		if ( -l $base_path) {
+			return 1;
+		};
+	};
+	return 0;
+};
+
+
+### WARNING not currently used. the find command seems to be significantly more performant, so we use that for the time being.
+## rec_dir_search (depricated)
+# search a given directory path and return everything in it. (recursive)
+# INPUT1: path to search
+# INPIT2: path to hack off the beginning
+# OUTPUT: array of all found files
+sub rec_dir_search {
+	my $search_path = $_[0];
+	my $root_path = $_[1];
+
+	$root_path=~s/\/\//\//g;
+	
+
+	my $strip_path = $search_path;
+	$strip_path=~s/\/\//\//g;
+	if (!($strip_path=~s/^\Q$root_path\E//)) {
+		warn("Error! '$root_path' is not a subset of '$strip_path'\n");
+		exit 1;
+	};
+
+	my @return;
+	
+	opendir(my $dh, "$search_path") or die "Could not read $search_path: $!\n";
+	while (my $file = readdir($dh)) {
+		if ($file ne "." && $file ne "..") {
+			push(@return, "$strip_path/$file");
+		};
+	};
+	closedir($dh);
+
+	foreach my $file (@return) {
+		if ( -d "$root_path/$file" && ! -l "$root_path/$file" ) {
+			push(@return, @{rec_dir_search("$root_path/$file", $root_path)});
+		};
+	};
+	return \@return;
+};
+
+## verbose
+# if $opt_verbose if defined, print the text.
+# INPUT1: text to print
+sub verbose {
+	if ($opt_verbose) {
+		print "$_[0]\n";
+	};
+}
+
+## uniq
+# make all entries in an array uniq.
+# INPUT1: array to condense
+# OUTPUT: fixed up array
+sub uniq {
+	my @newArray;
+	my %hash;
+	foreach my $entry (@_) {
+		$hash{$entry} = 1;
+	};
+	foreach my $key (keys %hash) {
+		push(@newArray, $key);
+	};
+
+	return @newArray;
+}
+
+sub get_filetree {
+	my $dir = shift(@_);
+	
+	my @files = ();
+	my $cwd = getcwd();
+	chdir($dir);
+	my @tmp = split("\n", `find .`);
+	chdir($cwd);
+
+	foreach my $file (@tmp) {
+		$file=~s/^\.//;
+		if (
+			$file && 
+			$file ne '/' && 
+			$file ne '.' && 
+			$file ne '..'
+		) {
+			push(@files, $file);
+		}
+	}
+	return @files;
+}
